@@ -1,0 +1,16 @@
+services:
+  bridge:
+    build: .
+    container_name: OpenPTT
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Voice needs a stable outbound UDP path; host networking avoids NAT
+    # surprises on some VPS providers. Drop this if your host is fine with
+    # the default bridge network.
+    network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
