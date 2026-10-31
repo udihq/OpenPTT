@@ -1,4 +1,4 @@
-// Command bridge is a two-guild Discord voice relay.
+// Command bridge is a two-guild Discord voice relay (OpenPTT).
 package main
 
 import (
@@ -21,11 +21,10 @@ import (
 	"github.com/udihq/OpenPTT/internal/bridge"
 	"github.com/udihq/OpenPTT/internal/commands"
 	"github.com/udihq/OpenPTT/internal/config"
+	"github.com/udihq/OpenPTT/internal/store"
 )
 
 func main() {
-	// .env is optional: in production the values usually come from the
-	// service manager or container environment.
 	_ = godotenv.Load()
 
 	cfg, err := config.Load()
@@ -41,20 +40,19 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(logger)
 
+	st := store.New(cfg.DataPath)
+	pair := st.Get()
+
 	router := handler.New()
 
 	client, err := disgo.New(cfg.Token,
 		bot.WithGatewayConfigOpts(
 			gateway.WithIntents(
-				// Guilds populates the guild cache used for command sync.
 				gateway.IntentGuilds,
-				// VoiceStates is the minimum required for voice joins to work.
 				gateway.IntentGuildVoiceStates,
 			),
 		),
 		bot.WithVoiceManagerConfigOpts(
-			// Wires DAVE (MLS) via Discord's own libdave. Without this the
-			// voice gateway closes the socket right after HELLO.
 			voice.WithDaveSessionCreateFunc(golibdave.NewSession),
 		),
 		bot.WithEventListeners(router),
@@ -65,17 +63,15 @@ func main() {
 	}
 
 	br := bridge.New(client, bridge.Config{
-		GuildA:   cfg.GuildA,
-		ChannelA: cfg.ChannelA,
-		GuildB:   cfg.GuildB,
-		ChannelB: cfg.ChannelB,
+		GuildA:   pair.GuildA,
+		ChannelA: pair.ChannelA,
+		GuildB:   pair.GuildB,
+		ChannelB: pair.ChannelB,
 		Bitrate:  cfg.Bitrate,
 	}, logger)
 
-	commands.New(br, logger).Register(router)
+	commands.New(br, st, logger).Register(router)
 
-	// Register slash commands in every guild once we know which guilds we are
-	// in. Guild-scoped commands are available immediately, unlike global ones.
 	client.AddEventListeners(bot.NewListenerFunc(func(e *events.Ready) {
 		defs := commands.Definitions()
 		for _, g := range e.Guilds {
@@ -95,9 +91,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger.Info("bridge online",
-		"guild_a", cfg.GuildA,
-		"guild_b", cfg.GuildB,
+	logger.Info("OpenPTT online",
+		"setup_ready", st.Ready(),
 		"bitrate", cfg.Bitrate,
 	)
 
