@@ -15,15 +15,12 @@ import (
 )
 
 var (
-	// ErrRunning is returned by Start when the bridge is already relaying.
-	ErrRunning = errors.New("bridge is already running")
-	// ErrNotRunning is returned by Stop when there is nothing to stop.
+	ErrRunning    = errors.New("bridge is already running")
 	ErrNotRunning = errors.New("bridge is not running")
 )
 
 const defaultBitrate = 64000
 
-// Config identifies the two guilds and the voice channel in each.
 type Config struct {
 	GuildA   snowflake.ID
 	ChannelA snowflake.ID
@@ -32,16 +29,12 @@ type Config struct {
 	Bitrate  int
 }
 
-// Bridge owns the pair of voice endpoints and their lifecycle.
 type Bridge struct {
 	client  *bot.Client
 	cfg     Config
 	log     *slog.Logger
 	bitrate int
-
-	// State is exported because command handlers need to mutate mute/floor.
-	State *State
-
+	State   *State
 	mu      sync.Mutex
 	a, b    *endpoint
 	running bool
@@ -62,8 +55,22 @@ func New(client *bot.Client, cfg Config, log *slog.Logger) *Bridge {
 	}
 }
 
-// Start joins both channels and begins relaying. It is all-or-nothing: if the
-// second join fails, the first connection is torn down before returning.
+// SetPair updates the two-guild channel pair (from /setup). Safe while stopped.
+func (b *Bridge) SetPair(guildA, channelA, guildB, channelB snowflake.ID) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cfg.GuildA = guildA
+	b.cfg.ChannelA = channelA
+	b.cfg.GuildB = guildB
+	b.cfg.ChannelB = channelB
+}
+
+func (b *Bridge) Pair() Config {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg
+}
+
 func (b *Bridge) Start(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -72,10 +79,10 @@ func (b *Bridge) Start(ctx context.Context) error {
 		return ErrRunning
 	}
 	if b.cfg.GuildA == 0 || b.cfg.GuildB == 0 || b.cfg.ChannelA == 0 || b.cfg.ChannelB == 0 {
-		return errors.New("guild and channel IDs must be configured in .env")
+		return errors.New("run /setup in both servers first")
 	}
 	if b.cfg.GuildA == b.cfg.GuildB {
-		return errors.New("GUILD_A_ID and GUILD_B_ID must be different servers")
+		return errors.New("sides must be different servers")
 	}
 
 	connA := b.client.VoiceManager().CreateConn(b.cfg.GuildA)
@@ -105,34 +112,23 @@ func (b *Bridge) Start(ctx context.Context) error {
 	b.a, b.b = endA, endB
 	b.running = true
 	b.started = time.Now()
-
-	b.log.Info("bridge started",
-		"guild_a", b.cfg.GuildA, "channel_a", b.cfg.ChannelA,
-		"guild_b", b.cfg.GuildB, "channel_b", b.cfg.ChannelB,
-	)
-
+	b.log.Info("bridge started", "guild_a", b.cfg.GuildA, "guild_b", b.cfg.GuildB)
 	return nil
 }
 
-// Stop tears down both connections. Safe to call when not running.
 func (b *Bridge) Stop(_ context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	if !b.running {
 		return ErrNotRunning
 	}
-
 	b.teardown(b.a, b.b)
 	b.a, b.b = nil, nil
 	b.running = false
-
 	b.log.Info("bridge stopped")
 	return nil
 }
 
-// teardown closes endpoints and connections. Callers must hold b.mu, except
-// Start's failure path which holds it via the deferred unlock.
 func (b *Bridge) teardown(endA, endB *endpoint) {
 	for _, end := range []*endpoint{endA, endB} {
 		if end == nil {
@@ -151,7 +147,6 @@ func (b *Bridge) teardown(endA, endB *endpoint) {
 	}
 }
 
-// Status is a snapshot for the /bridge status command.
 type Status struct {
 	Running  bool
 	Started  time.Time
@@ -168,31 +163,23 @@ type Status struct {
 func (b *Bridge) Status() Status {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	s := Status{
-		Running:  b.running,
-		Started:  b.started,
-		GuildA:   b.cfg.GuildA,
-		ChannelA: b.cfg.ChannelA,
-		GuildB:   b.cfg.GuildB,
-		ChannelB: b.cfg.ChannelB,
-		Muted:    b.State.MutedCount(),
-		Floor:    b.State.Floor(),
+		Running: b.running, Started: b.started,
+		GuildA: b.cfg.GuildA, ChannelA: b.cfg.ChannelA,
+		GuildB: b.cfg.GuildB, ChannelB: b.cfg.ChannelB,
+		Muted: b.State.MutedCount(), Floor: b.State.Floor(),
 	}
-
 	if b.a != nil {
 		s.DAVEA = b.a.conn.DAVE().Ready()
 	}
 	if b.b != nil {
 		s.DAVEB = b.b.conn.DAVE().Ready()
 	}
-
 	return s
 }
 
 func openWithTimeout(ctx context.Context, conn voice.Conn, channelID snowflake.ID) error {
 	openCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	// selfMute=false, selfDeaf=false: a deafened bot receives no audio.
 	return conn.Open(openCtx, channelID, false, false)
 }
