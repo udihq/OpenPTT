@@ -1,82 +1,44 @@
-// Package config loads and validates the bridge's runtime configuration from
-// environment variables (optionally seeded from a .env file by the caller).
 package config
 
 import (
 	"fmt"
 	"os"
 	"strconv"
-
-	"github.com/disgoorg/snowflake/v2"
 )
 
-// Config is the fully validated runtime configuration.
+// Config is runtime config. Only the bot token is required from the environment.
+// Guild/channel pairs are set in Discord with /setup and stored on disk.
 type Config struct {
 	Token    string
-	GuildA   snowflake.ID
-	ChannelA snowflake.ID
-	GuildB   snowflake.ID
-	ChannelB snowflake.ID
+	DataPath string
 	Bitrate  int
 	Debug    bool
 }
 
 const defaultBitrate = 64000
 
-// Load reads configuration from the environment and fails fast on anything
-// missing or malformed. There are no silent defaults for IDs: a misconfigured
-// bridge that half-starts is worse than one that refuses to start.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Token:   os.Getenv("DISCORD_TOKEN"),
-		Bitrate: defaultBitrate,
-		Debug:   os.Getenv("DEBUG") == "true",
+		Token:    os.Getenv("DISCORD_TOKEN"),
+		DataPath: os.Getenv("DATA_PATH"),
+		Bitrate:  defaultBitrate,
+		Debug:    os.Getenv("DEBUG") == "true",
 	}
-
 	if cfg.Token == "" {
-		return nil, fmt.Errorf("DISCORD_TOKEN is required")
+		return nil, fmt.Errorf("DISCORD_TOKEN is required — set it in your host env or .env")
 	}
-
-	var err error
-	if cfg.GuildA, err = requireID("GUILD_A_ID"); err != nil {
-		return nil, err
+	if cfg.DataPath == "" {
+		cfg.DataPath = "data/config.json"
 	}
-	if cfg.ChannelA, err = requireID("CHANNEL_A_ID"); err != nil {
-		return nil, err
-	}
-	if cfg.GuildB, err = requireID("GUILD_B_ID"); err != nil {
-		return nil, err
-	}
-	if cfg.ChannelB, err = requireID("CHANNEL_B_ID"); err != nil {
-		return nil, err
-	}
-
-	if cfg.GuildA == cfg.GuildB {
-		return nil, fmt.Errorf("GUILD_A_ID and GUILD_B_ID must be different servers")
-	}
-
 	if raw := os.Getenv("BITRATE"); raw != "" {
-		bitrate, err := strconv.Atoi(raw)
+		n, err := strconv.Atoi(raw)
 		if err != nil {
 			return nil, fmt.Errorf("BITRATE: %w", err)
 		}
-		if bitrate < 6000 || bitrate > 510000 {
-			return nil, fmt.Errorf("BITRATE: %d is outside the valid range 6000-510000", bitrate)
+		if n < 6000 || n > 510000 {
+			return nil, fmt.Errorf("BITRATE out of range")
 		}
-		cfg.Bitrate = bitrate
+		cfg.Bitrate = n
 	}
-
 	return cfg, nil
-}
-
-func requireID(key string) (snowflake.ID, error) {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return 0, fmt.Errorf("%s is required", key)
-	}
-	id, err := snowflake.Parse(raw)
-	if err != nil {
-		return 0, fmt.Errorf("%s: %q is not a valid snowflake ID", key, raw)
-	}
-	return id, nil
 }
