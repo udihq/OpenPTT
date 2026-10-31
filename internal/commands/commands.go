@@ -1,4 +1,4 @@
-// Package commands defines and handles the /bridge slash command tree.
+// Package commands defines and handles the /bridge and /setup slash commands.
 package commands
 
 import (
@@ -12,83 +12,88 @@ import (
 	"github.com/disgoorg/snowflake/v2"
 
 	"github.com/udihq/OpenPTT/internal/bridge"
+	"github.com/udihq/OpenPTT/internal/store"
 )
 
-// Handlers binds slash command routes to the bridge.
 type Handlers struct {
-	b   *bridge.Bridge
-	log *slog.Logger
+	b     *bridge.Bridge
+	store *store.Store
+	log   *slog.Logger
 }
 
-func New(b *bridge.Bridge, log *slog.Logger) *Handlers {
-	return &Handlers{b: b, log: log}
+func New(b *bridge.Bridge, st *store.Store, log *slog.Logger) *Handlers {
+	return &Handlers{b: b, store: st, log: log}
 }
 
-// Definitions returns the command tree registered per guild.
-//
-// DefaultMemberPermissions gates these to Manage Server by default. That is
-// enforced by Discord, not by us, so there is no permission check to get wrong
-// in the handler.
 func Definitions() []discord.ApplicationCommandCreate {
 	perms := discord.PermissionManageGuild
 
-	userIDOption := func() []discord.ApplicationCommandOption {
-		return []discord.ApplicationCommandOption{
-			discord.ApplicationCommandOptionString{
-				Name:        "user_id",
-				Description: "Target user ID (right-click user -> Copy User ID). Omit to target yourself.",
-				Required:    false,
-			},
-		}
+	userIDOption := []discord.ApplicationCommandOption{
+		discord.ApplicationCommandOptionString{
+			Name:        "user_id",
+			Description: "Target user ID (Copy User ID). Omit = yourself.",
+			Required:    false,
+		},
 	}
 
 	return []discord.ApplicationCommandCreate{
 		discord.SlashCommandCreate{
-			Name:                     "bridge",
-			Description:              "Cross-server voice bridge",
+			Name:                     "setup",
+			Description:              "Link this server voice channel into OpenPTT",
 			DefaultMemberPermissions: &perms,
 			Options: []discord.ApplicationCommandOption{
 				discord.ApplicationCommandOptionSubCommand{
-					Name:        "start",
-					Description: "Join both configured channels and relay audio both ways",
+					Name:        "a",
+					Description: "Set this server as side A",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionChannel{
+							Name:         "channel",
+							Description:  "Voice channel to bridge",
+							Required:     true,
+							ChannelTypes: []discord.ChannelType{discord.ChannelTypeGuildVoice},
+						},
+					},
 				},
 				discord.ApplicationCommandOptionSubCommand{
-					Name:        "stop",
-					Description: "Stop relaying and leave both channels",
+					Name:        "b",
+					Description: "Set this server as side B",
+					Options: []discord.ApplicationCommandOption{
+						discord.ApplicationCommandOptionChannel{
+							Name:         "channel",
+							Description:  "Voice channel to bridge",
+							Required:     true,
+							ChannelTypes: []discord.ChannelType{discord.ChannelTypeGuildVoice},
+						},
+					},
 				},
 				discord.ApplicationCommandOptionSubCommand{
-					Name:        "status",
-					Description: "Show bridge state, DAVE readiness, and mute count",
+					Name:        "show",
+					Description: "Show current bridge pair",
 				},
-				discord.ApplicationCommandOptionSubCommand{
-					Name:        "mute",
-					Description: "Mute a user's audio in the bridge",
-					Options:     userIDOption(),
-				},
-				discord.ApplicationCommandOptionSubCommand{
-					Name:        "unmute",
-					Description: "Unmute a user's audio in the bridge",
-					Options:     userIDOption(),
-				},
-				discord.ApplicationCommandOptionSubCommand{
-					Name:        "muteall",
-					Description: "Mute every user the bridge has seen this session",
-				},
-				discord.ApplicationCommandOptionSubCommand{
-					Name:        "unmuteall",
-					Description: "Clear the entire mute list",
-				},
-				discord.ApplicationCommandOptionSubCommand{
-					Name:        "floor",
-					Description: "Toggle floor mode: only one speaker per server is relayed at a time",
-				},
+			},
+		},
+		discord.SlashCommandCreate{
+			Name:                     "bridge",
+			Description:              "Control the cross-server voice bridge",
+			DefaultMemberPermissions: &perms,
+			Options: []discord.ApplicationCommandOption{
+				discord.ApplicationCommandOptionSubCommand{Name: "start", Description: "Join both channels and relay audio"},
+				discord.ApplicationCommandOptionSubCommand{Name: "stop", Description: "Stop and leave both channels"},
+				discord.ApplicationCommandOptionSubCommand{Name: "status", Description: "Show state, DAVE, mutes"},
+				discord.ApplicationCommandOptionSubCommand{Name: "mute", Description: "Mute a user in the bridge", Options: userIDOption},
+				discord.ApplicationCommandOptionSubCommand{Name: "unmute", Description: "Unmute a user", Options: userIDOption},
+				discord.ApplicationCommandOptionSubCommand{Name: "muteall", Description: "Mute everyone seen this session"},
+				discord.ApplicationCommandOptionSubCommand{Name: "unmuteall", Description: "Clear mute list"},
+				discord.ApplicationCommandOptionSubCommand{Name: "floor", Description: "Toggle one-speaker-per-server floor mode"},
 			},
 		},
 	}
 }
 
-// Register attaches every route to the router.
 func (h *Handlers) Register(r handler.Router) {
+	r.SlashCommand("/setup/a", h.setupA)
+	r.SlashCommand("/setup/b", h.setupB)
+	r.SlashCommand("/setup/show", h.setupShow)
 	r.SlashCommand("/bridge/start", h.start)
 	r.SlashCommand("/bridge/stop", h.stop)
 	r.SlashCommand("/bridge/status", h.status)
@@ -99,98 +104,145 @@ func (h *Handlers) Register(r handler.Router) {
 	r.SlashCommand("/bridge/floor", h.floor)
 }
 
+func (h *Handlers) setupA(data discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
+	ch, ok := data.OptChannel("channel")
+	if !ok {
+		return respond(e, "Pick a voice channel.", true)
+	}
+	var gid snowflake.ID
+	if e.GuildID() != nil {
+		gid = *e.GuildID()
+	}
+	if err := h.store.SetSideA(gid, ch.ID); err != nil {
+		return respond(e, "Failed to save: "+err.Error(), true)
+	}
+	h.syncBridge()
+	msg := fmt.Sprintf("Side A set to <#%d>.\n", ch.ID)
+	if h.store.Ready() {
+		msg += "Both sides set. Run /bridge start."
+	} else {
+		msg += "Now run /setup b in the other server."
+	}
+	return respond(e, msg, false)
+}
+
+func (h *Handlers) setupB(data discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
+	ch, ok := data.OptChannel("channel")
+	if !ok {
+		return respond(e, "Pick a voice channel.", true)
+	}
+	var gid snowflake.ID
+	if e.GuildID() != nil {
+		gid = *e.GuildID()
+	}
+	if err := h.store.SetSideB(gid, ch.ID); err != nil {
+		return respond(e, "Failed to save: "+err.Error(), true)
+	}
+	h.syncBridge()
+	msg := fmt.Sprintf("Side B set to <#%d>.\n", ch.ID)
+	if h.store.Ready() {
+		msg += "Both sides set. Run /bridge start."
+	} else {
+		msg += "Now run /setup a in the other server."
+	}
+	return respond(e, msg, false)
+}
+
+func (h *Handlers) setupShow(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
+	p := h.store.Get()
+	if !h.store.Ready() {
+		return respond(e, "Pair incomplete. /setup a in server 1, /setup b in server 2.", true)
+	}
+	return respond(e, fmt.Sprintf("A: `%s` -> <#%d>\nB: `%s` -> <#%d>", p.GuildA, p.ChannelA, p.GuildB, p.ChannelB), true)
+}
+
+func (h *Handlers) syncBridge() {
+	p := h.store.Get()
+	h.b.SetPair(p.GuildA, p.ChannelA, p.GuildB, p.ChannelB)
+}
+
 func (h *Handlers) start(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
+	h.syncBridge()
+	if !h.store.Ready() {
+		return respond(e, "Setup incomplete. /setup a then /setup b.", true)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
 	if err := h.b.Start(ctx); err != nil {
-		return respond(e, "❌ "+err.Error(), true)
+		return respond(e, err.Error(), true)
 	}
-	return respond(e, "✅ Bridge started. Both channels are joined and audio is relaying in both directions.", false)
+	return respond(e, "Bridge live. Audio relays both ways.", false)
 }
 
 func (h *Handlers) stop(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	if err := h.b.Stop(context.Background()); err != nil {
-		return respond(e, "⚠️ "+err.Error(), true)
+		return respond(e, err.Error(), true)
 	}
-	return respond(e, "🛑 Bridge stopped. The bot has left both channels.", false)
+	return respond(e, "Bridge stopped.", false)
 }
 
 func (h *Handlers) status(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	s := h.b.Status()
-
 	if !s.Running {
-		return respond(e, "**Bridge:** stopped\nUse `/bridge start` to bring it up.", true)
+		ready := "incomplete"
+		if h.store.Ready() {
+			ready = "ready - use /bridge start"
+		}
+		return respond(e, "Bridge: stopped\nSetup: "+ready, true)
 	}
-
 	uptime := time.Since(s.Started).Truncate(time.Second)
-	dave := func(ready bool) string {
-		if ready {
+	dave := func(r bool) string {
+		if r {
 			return "ready"
 		}
-		return "**not ready** (no audio will flow)"
+		return "not ready"
 	}
 	floor := "off"
 	if s.Floor {
 		floor = "on"
 	}
-
-	msg := fmt.Sprintf(
-		"**Bridge:** running for `%s`\n"+
-			"**A:** <#%d> — DAVE %s\n"+
-			"**B:** <#%d> — DAVE %s\n"+
-			"**Muted users:** %d\n"+
-			"**Floor mode:** %s",
-		uptime,
-		s.ChannelA, dave(s.DAVEA),
-		s.ChannelB, dave(s.DAVEB),
-		s.Muted,
-		floor,
-	)
+	msg := fmt.Sprintf("Running %s\nA: <#%d> DAVE %s\nB: <#%d> DAVE %s\nMuted: %d\nFloor: %s",
+		uptime, s.ChannelA, dave(s.DAVEA), s.ChannelB, dave(s.DAVEB), s.Muted, floor)
 	return respond(e, msg, true)
 }
 
 func (h *Handlers) mute(data discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	target, err := resolveTarget(data, e)
 	if err != nil {
-		return respond(e, "❌ "+err.Error(), true)
+		return respond(e, err.Error(), true)
 	}
 	h.b.State.Mute(target)
-	return respond(e, fmt.Sprintf("🔇 <@%d> is muted in the bridge.", target), false)
+	return respond(e, fmt.Sprintf("<@%d> muted.", target), false)
 }
 
 func (h *Handlers) unmute(data discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	target, err := resolveTarget(data, e)
 	if err != nil {
-		return respond(e, "❌ "+err.Error(), true)
+		return respond(e, err.Error(), true)
 	}
 	h.b.State.Unmute(target)
-	return respond(e, fmt.Sprintf("🔊 <@%d> is unmuted in the bridge.", target), false)
+	return respond(e, fmt.Sprintf("<@%d> unmuted.", target), false)
 }
 
 func (h *Handlers) muteAll(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	n := h.b.State.MuteAll()
-	return respond(e, fmt.Sprintf("🔇 Muted %d user(s). Use `/bridge unmuteall` to clear.", n), false)
+	return respond(e, fmt.Sprintf("Muted %d user(s).", n), false)
 }
 
 func (h *Handlers) unmuteAll(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	h.b.State.UnmuteAll()
-	return respond(e, "🔊 Mute list cleared.", false)
+	return respond(e, "Mute list cleared.", false)
 }
 
 func (h *Handlers) floor(_ discord.SlashCommandInteractionData, e *handler.CommandEvent) error {
 	next := !h.b.State.Floor()
 	h.b.State.SetFloor(next)
-
 	if next {
-		return respond(e, "🎙️ Floor mode **on**. One speaker per server at a time; the floor releases after ~400 ms of silence.", false)
+		return respond(e, "Floor on - one speaker per server.", false)
 	}
-	return respond(e, "🎙️ Floor mode **off**. All unmuted speakers are mixed together.", false)
+	return respond(e, "Floor off - all unmuted mixed.", false)
 }
 
-// resolveTarget returns the user_id option if supplied, otherwise the invoking
-// user. Using a string option rather than a user option keeps the handler
-// independent of disgo's resolved-user accessor surface.
 func resolveTarget(data discord.SlashCommandInteractionData, e *handler.CommandEvent) (snowflake.ID, error) {
 	if raw, ok := data.OptString("user_id"); ok && raw != "" {
 		id, err := snowflake.Parse(raw)
@@ -199,10 +251,9 @@ func resolveTarget(data discord.SlashCommandInteractionData, e *handler.CommandE
 		}
 		return id, nil
 	}
-
 	id := e.Interaction.User().ID
 	if id == 0 {
-		return 0, fmt.Errorf("could not determine the invoking user; pass user_id explicitly")
+		return 0, fmt.Errorf("pass user_id")
 	}
 	return id, nil
 }
